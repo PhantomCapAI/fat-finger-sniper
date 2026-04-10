@@ -19,7 +19,7 @@ from db import init_db, close_db, get_stats, get_recent_opportunities, add_black
 from engine.executor import process_opportunity
 from engine.killswitch import handle_callback
 from engine.pipeline import send_to_pipeline, send_fun_telegram
-from monitors import opensea, magiceden, tensor, jupiter, polymarket
+from monitors import opensea, magiceden, tensor, jupiter, polymarket, crossdex
 from monitors import stockx, tcgplayer, godaddy, ebay
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -80,13 +80,20 @@ async def nft_sol_scanner():
 
 
 async def dex_scanner():
-    """Poll Jupiter for DEX misprices."""
+    """Poll Jupiter + cross-DEX comparator for misprices."""
     while True:
         try:
             opps = await jupiter.scan()
             await _process_all(opps)
         except Exception as e:
-            logger.error(f"DEX scan: {e}")
+            logger.error(f"Jupiter scan: {e}")
+
+        try:
+            cross_opps = await crossdex.scan()
+            await _process_all(cross_opps)
+        except Exception as e:
+            logger.error(f"Cross-DEX scan: {e}")
+
         await asyncio.sleep(POLL_INTERVAL_DEX)
 
 
@@ -300,6 +307,21 @@ async def scan_tensor(slug: str):
 async def scan_polymarket():
     opps = await polymarket.scan()
     return {"marketplace": "polymarket", "opportunities": opps, "count": len(opps)}
+
+
+@app.get("/scan/crossdex")
+async def scan_crossdex():
+    opps = await crossdex.scan()
+    return {"marketplace": "crossdex", "tokens_monitored": list(crossdex.MONITOR_TOKENS.keys()), "opportunities": opps, "count": len(opps)}
+
+
+@app.get("/scan/crossdex/{symbol}")
+async def scan_crossdex_token(symbol: str):
+    token_info = crossdex.MONITOR_TOKENS.get(symbol.upper())
+    if not token_info:
+        return {"error": f"Unknown token: {symbol}", "available": list(crossdex.MONITOR_TOKENS.keys())}
+    opps = await crossdex.scan_token(symbol.upper(), token_info)
+    return {"token": symbol.upper(), "opportunities": opps, "count": len(opps)}
 
 
 # --- Blacklist ---
