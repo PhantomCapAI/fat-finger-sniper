@@ -13,6 +13,7 @@ from db import (
 )
 from engine.killswitch import send_killswitch_alert, wait_for_decision, update_message
 from engine.honeypot import is_safe_opportunity
+from engine.autosell import schedule_autosell
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,15 @@ async def process_opportunity(opp: dict) -> dict:
             result["action"] = "executed"
             result["tx_hash"] = tx_hash
             result["cost_usd"] = cost_usd
+
+            # Auto-sell: list/swap for profit immediately
+            try:
+                sell_hash = await schedule_autosell(opp, tx_hash)
+                if sell_hash:
+                    result["sell_tx"] = sell_hash
+                    logger.info(f"Auto-sell queued: {sell_hash}")
+            except Exception as e:
+                logger.error(f"Auto-sell failed: {e}")
         else:
             await update_message(opp_id, "failed")
             result["action"] = "failed"
