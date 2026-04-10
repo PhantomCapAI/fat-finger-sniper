@@ -2,3 +2,6 @@ fastapi==0.115.12
 uvicorn==0.34.2
 httpx==0.28.1
 asyncpg==0.30.0
+web3==7.9.0
+solders==0.25.0
+base58==2.1.1

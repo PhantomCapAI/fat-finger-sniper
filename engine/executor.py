@@ -163,9 +163,13 @@ async def _execute_buy(opp: dict) -> str | None:
         )
 
     elif marketplace == "opensea":
-        # OpenSea requires Seaport SDK — needs web3.py integration
-        logger.warning(f"OpenSea buy not yet wired (needs Seaport fulfillment)")
-        return None
+        from engine.buy.opensea_buy import execute_opensea_buy
+        order_hash = opp.get("metadata", {}).get("order_hash", "")
+        protocol = opp.get("metadata", {}).get("protocol_address", "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC")
+        if not order_hash:
+            logger.warning("OpenSea buy: no order_hash in opportunity metadata")
+            return None
+        return await execute_opensea_buy(order_hash, protocol, chain)
 
     elif marketplace in ("stockx", "tcgplayer", "godaddy", "ebay"):
         # Traditional marketplaces — HTTP purchase APIs

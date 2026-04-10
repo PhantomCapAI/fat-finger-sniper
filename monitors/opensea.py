@@ -76,7 +76,12 @@ async def scan(slug: str) -> list[dict]:
             currency=payment.get("symbol", "ETH"),
             url=f"https://opensea.io/assets/ethereum/{contract}/{token_id}",
             seller=event.get("maker", ""),
-            extra={"collection": slug, "volume": stats["volume"]},
+            extra={
+                "collection": slug,
+                "volume": stats["volume"],
+                "order_hash": event.get("order_hash", ""),
+                "protocol_address": event.get("protocol_address", "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC"),
+            },
         )
         if opp:
             opps.append(opp)
