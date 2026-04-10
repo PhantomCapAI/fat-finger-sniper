@@ -3,7 +3,7 @@
 import logging
 import httpx
 
-from config import JUPITER_API_BASE
+from config import JUPITER_API_BASE, JUPITER_API_KEY
 from engine.detector import build_opportunity
 
 logger = logging.getLogger(__name__)
@@ -24,11 +24,15 @@ async def get_price(mint: str) -> float | None:
 
     GET https://api.jup.ag/price/v2?ids={mint}
     """
+    headers = {}
+    if JUPITER_API_KEY:
+        headers["x-api-key"] = JUPITER_API_KEY
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{JUPITER_API_BASE}/price/v2",
                 params={"ids": mint},
+                headers=headers,
             )
             if resp.status_code != 200:
                 return None
@@ -46,6 +50,9 @@ async def get_quote(input_mint: str, output_mint: str, amount: int) -> dict | No
 
     GET https://api.jup.ag/quote/v6?inputMint=X&outputMint=Y&amount=Z
     """
+    headers = {}
+    if JUPITER_API_KEY:
+        headers["x-api-key"] = JUPITER_API_KEY
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
@@ -56,6 +63,7 @@ async def get_quote(input_mint: str, output_mint: str, amount: int) -> dict | No
                     "amount": str(amount),
                     "slippageBps": "50",
                 },
+                headers=headers,
             )
             if resp.status_code != 200:
                 return None

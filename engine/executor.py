@@ -1,13 +1,11 @@
 """Trade executor — paper mode + live execution with risk controls."""
 
-import asyncio
 import logging
 import time
-from datetime import datetime, timezone
 
 from config import (
     PAPER_MODE, MAX_PER_SNIPE_USD, MAX_DAILY_USD, MAX_BANKROLL_USD,
-    COOLDOWN_SECONDS, GAS_MULTIPLIER_MAX,
+    COOLDOWN_SECONDS,
 )
 from db import (
     is_duplicate, record_purchase, get_daily_spend, add_daily_spend,
@@ -23,10 +21,7 @@ _total_spent: float = 0
 
 
 async def process_opportunity(opp: dict) -> dict:
-    """Full pipeline: validate → honeypot → alert → wait → execute/cancel.
-
-    Returns result dict with action taken.
-    """
+    """Full pipeline: validate -> honeypot -> alert -> wait -> execute/cancel."""
     global _last_snipe_time, _total_spent
 
     asset_id = opp["asset_id"]
@@ -45,8 +40,7 @@ async def process_opportunity(opp: dict) -> dict:
         return result
 
     # --- Estimate USD cost ---
-    # TODO: Real price feeds. For now use listing_price as proxy.
-    cost_usd = listing_price  # Simplified — needs oracle for real USD conversion
+    cost_usd = _estimate_usd(opp)
 
     # --- Risk controls ---
     if cost_usd > MAX_PER_SNIPE_USD:
@@ -119,23 +113,65 @@ async def process_opportunity(opp: dict) -> dict:
     return result
 
 
-async def _execute_buy(opp: dict) -> str | None:
-    """Execute the actual purchase transaction.
+def _estimate_usd(opp: dict) -> float:
+    """Rough USD estimate for an opportunity."""
+    price = opp.get("listing_price", 0)
+    currency = opp.get("currency", "").upper()
 
-    Routes to the appropriate marketplace SDK based on opp details.
-    Returns tx hash on success, None on failure.
-    """
+    # Rough price multipliers — real implementation would use live oracle
+    multipliers = {
+        "SOL": 83.0,
+        "ETH": 1600.0,
+        "MATIC": 0.22,
+        "BNB": 300.0,
+        "USDC": 1.0,
+        "USD": 1.0,
+    }
+    mult = multipliers.get(currency, 1.0)
+    return price * mult
+
+
+async def _execute_buy(opp: dict) -> str | None:
+    """Route to the appropriate marketplace buy function."""
     marketplace = opp["marketplace"]
     chain = opp["chain"]
 
-    # TODO: Implement per-marketplace execution
-    # Each marketplace has its own buy flow:
-    # - OpenSea: Seaport fulfillment via web3
-    # - Magic Eden: Direct Solana instruction
-    # - Tensor: Tensor SDK buy instruction
-    # - Jupiter: Swap instruction
-    # - Polymarket: CLOB order via API
-    # - StockX/TCGPlayer/GoDaddy/eBay: HTTP purchase APIs
+    if marketplace == "jupiter":
+        from engine.buy.jupiter_buy import execute_jupiter_swap
+        # For Jupiter, asset_id is the output mint, buy with SOL
+        sol_mint = "So11111111111111111111111111111111111111112"
+        amount_lamports = int(opp["listing_price"] * 1_000_000_000)
+        return await execute_jupiter_swap(sol_mint, opp["asset_id"], amount_lamports)
 
-    logger.warning(f"Live execution not yet implemented for {marketplace}/{chain}")
-    return None
+    elif marketplace == "magiceden":
+        from engine.buy.magiceden_buy import execute_magiceden_buy
+        price_lamports = int(opp["listing_price"] * 1_000_000_000)
+        return await execute_magiceden_buy(opp["asset_id"], price_lamports)
+
+    elif marketplace == "tensor":
+        from engine.buy.tensor_buy import execute_tensor_buy
+        price_lamports = int(opp["listing_price"] * 1_000_000_000)
+        seller = opp.get("seller", "")
+        return await execute_tensor_buy(opp["asset_id"], price_lamports, seller)
+
+    elif marketplace == "polymarket":
+        from engine.buy.polymarket_buy import execute_polymarket_buy
+        return await execute_polymarket_buy(
+            opp["asset_id"],
+            opp["listing_price"],
+            opp.get("metadata", {}).get("ask_size", 10),
+        )
+
+    elif marketplace == "opensea":
+        # OpenSea requires Seaport SDK — needs web3.py integration
+        logger.warning(f"OpenSea buy not yet wired (needs Seaport fulfillment)")
+        return None
+
+    elif marketplace in ("stockx", "tcgplayer", "godaddy", "ebay"):
+        # Traditional marketplaces — HTTP purchase APIs
+        logger.warning(f"{marketplace} buy: traditional marketplace execution not yet wired")
+        return None
+
+    else:
+        logger.warning(f"Unknown marketplace: {marketplace}")
+        return None

@@ -37,6 +37,7 @@ BSC_RPC_URL = os.environ.get("BSC_RPC_URL", "https://bsc-dataseed.binance.org")
 
 OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "")
 TENSOR_API_KEY = os.environ.get("TENSOR_API_KEY", "")
+JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY", "")
 
 # --- Relay.link (cross-chain bridging) ---
 RELAY_API_BASE = "https://api.relay.link"
