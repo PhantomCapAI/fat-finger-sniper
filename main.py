@@ -17,7 +17,7 @@ from config import (
 )
 from db import init_db, close_db, get_stats, get_recent_opportunities, add_blacklist
 from engine.executor import process_opportunity
-from engine.killswitch import handle_callback
+from engine.killswitch import handle_callback, handle_text_command
 from engine.pipeline import send_to_pipeline, send_fun_telegram
 from monitors import opensea, magiceden, tensor, jupiter, polymarket, crossdex
 from monitors import stockx, tcgplayer, godaddy, ebay
@@ -340,8 +340,14 @@ async def add_to_blacklist(request: Request):
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
-    """Handle Telegram inline keyboard callbacks (CANCEL / BUY NOW)."""
+    """Handle Telegram inline keyboard callbacks + text commands."""
     body = await request.json()
+
+    message = body.get("message")
+    if message:
+        await handle_text_command(message)
+        return {"ok": True}
+
     callback = body.get("callback_query")
     if not callback:
         return {"ok": True}

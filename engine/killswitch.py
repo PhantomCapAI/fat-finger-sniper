@@ -1,4 +1,8 @@
-"""Telegram kill switch — 60-second window with inline keyboard."""
+"""Telegram kill switch — 60-second window with inline keyboard.
+
+Also hosts text-command handlers (/start /status /stop /paper /balance)
+since they share the same bot token and HTTP client machinery.
+"""
 
 import asyncio
 import logging
@@ -6,12 +10,28 @@ import time
 
 import httpx
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, KILLSWITCH_TIMEOUT_SECONDS
+from config import (
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, KILLSWITCH_TIMEOUT_SECONDS,
+    PAPER_MODE, MAX_PER_SNIPE_USD, MAX_DAILY_USD, MAX_BANKROLL_USD,
+    SOLANA_RPC_URL, PHANTOM_TREASURY,
+)
 
 logger = logging.getLogger(__name__)
 
 # Track pending opportunities: opp_id -> {"cancelled": bool, "expires": float}
 _pending: dict[int, dict] = {}
+
+# Global scanner pause flag — /stop sets this, executor checks it.
+_scanner_paused: bool = False
+
+
+def is_scanner_paused() -> bool:
+    return _scanner_paused
+
+
+def set_scanner_paused(paused: bool) -> None:
+    global _scanner_paused
+    _scanner_paused = paused
 
 
 def _format_alert(opp: dict, opp_id: int) -> str:
@@ -150,3 +170,120 @@ async def update_message(opp_id: int, result: str):
         logger.error(f"Update message failed: {e}")
 
     _pending.pop(opp_id, None)
+
+
+# --- Text command handlers ---------------------------------------------
+
+async def _send_message(chat_id: str, text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                url,
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            )
+    except Exception as e:
+        logger.error(f"send_message failed: {e}")
+
+
+async def _get_sol_balance(pubkey: str) -> float | None:
+    if not pubkey or not SOLANA_RPC_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                SOLANA_RPC_URL,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]},
+            )
+            data = resp.json()
+            lamports = data.get("result", {}).get("value", 0)
+            return lamports / 1_000_000_000
+    except Exception as e:
+        logger.error(f"getBalance failed: {e}")
+        return None
+
+
+async def _format_status() -> str:
+    # Lazy imports to avoid circular dep on db.py at module load
+    try:
+        from db import get_stats, get_daily_spend
+        stats = await get_stats()
+        total = stats.get("total_opportunities", 0) if isinstance(stats, dict) else 0
+        executed = stats.get("executed", 0) if isinstance(stats, dict) else 0
+        daily = await get_daily_spend()
+    except Exception as e:
+        logger.error(f"status db read failed: {e}")
+        total = executed = 0
+        daily = 0.0
+
+    mode_line = "\u2705 ON" if PAPER_MODE else "\U0001f6a8 OFF"
+    pause_line = " (PAUSED)" if _scanner_paused else ""
+    return (
+        f"<b>\U0001f3af PHANTOMFINGER STATUS</b>{pause_line}\n\n"
+        f"<b>Paper mode:</b> {mode_line}\n"
+        f"<b>Wallet:</b> <code>{PHANTOM_TREASURY[:4]}...{PHANTOM_TREASURY[-4:]}</code>\n"
+        f"<b>Spent today:</b> ${daily:.2f} / ${MAX_DAILY_USD:.0f}\n"
+        f"<b>Per-snipe cap:</b> ${MAX_PER_SNIPE_USD:.0f}\n"
+        f"<b>Bankroll cap:</b> ${MAX_BANKROLL_USD:.0f}\n"
+        f"<b>Opportunities logged:</b> {total}\n"
+        f"<b>Executed:</b> {executed}"
+    )
+
+
+async def handle_text_command(message: dict) -> None:
+    """Dispatch /start /status /stop /paper /balance.
+
+    Silently ignores messages from unauthorized chats and unknown commands.
+    """
+    text = (message.get("text") or "").strip()
+    chat_id = str(message.get("chat", {}).get("id", ""))
+
+    if chat_id != TELEGRAM_CHAT_ID:
+        return
+    if not text.startswith("/"):
+        return
+
+    cmd = text.split()[0].split("@")[0].lower()
+
+    if cmd == "/start":
+        mode = "\u2705 ON" if PAPER_MODE else "\U0001f6a8 OFF"
+        reply = (
+            f"<b>\U0001f3af PHANTOMFINGER armed</b>\n\n"
+            f"Paper mode: {mode}\n"
+            f"Commands: /status /stop /paper /balance"
+        )
+        await _send_message(chat_id, reply)
+
+    elif cmd == "/status":
+        await _send_message(chat_id, await _format_status())
+
+    elif cmd == "/stop":
+        set_scanner_paused(True)
+        await _send_message(
+            chat_id,
+            "<b>\U0001f6d1 Scanner PAUSED</b>\n\nNew opportunities will be skipped. "
+            "Restart the service to resume (no /start_snipe command yet).",
+        )
+
+    elif cmd == "/paper":
+        # Read-only: never toggle paper mode from a Telegram command.
+        mode = "\u2705 ON (safe)" if PAPER_MODE else "\U0001f6a8 OFF (LIVE)"
+        await _send_message(
+            chat_id,
+            f"<b>Paper mode:</b> {mode}\n\n"
+            f"To change, update PAPER_MODE env var on Zeabur and restart. "
+            f"Intentionally not toggleable from Telegram.",
+        )
+
+    elif cmd == "/balance":
+        bal = await _get_sol_balance(PHANTOM_TREASURY)
+        if bal is None:
+            await _send_message(chat_id, "Balance query failed (RPC or wallet unset).")
+        else:
+            await _send_message(
+                chat_id,
+                f"<b>Wallet:</b> <code>{PHANTOM_TREASURY[:4]}...{PHANTOM_TREASURY[-4:]}</code>\n"
+                f"<b>SOL balance:</b> {bal:.4f} SOL",
+            )

@@ -10,55 +10,53 @@ logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS opportunities (
-    id SERIAL PRIMARY KEY,
-    ts TIMESTAMPTZ DEFAULT NOW(),
-    marketplace TEXT NOT NULL,
-    chain TEXT NOT NULL,
-    asset_id TEXT NOT NULL,
-    asset_name TEXT,
-    listing_price NUMERIC NOT NULL,
-    fair_value NUMERIC NOT NULL,
-    discount_pct NUMERIC NOT NULL,
-    confidence TEXT NOT NULL,
-    action TEXT DEFAULT 'pending',
-    tx_hash TEXT,
-    cost_usd NUMERIC,
-    paper_mode BOOLEAN DEFAULT TRUE,
-    alert_sent BOOLEAN DEFAULT FALSE,
-    cancelled BOOLEAN DEFAULT FALSE,
-    executed BOOLEAN DEFAULT FALSE,
-    metadata JSONB DEFAULT '{}'
-);
-
-CREATE TABLE IF NOT EXISTS daily_spend (
-    date DATE PRIMARY KEY,
-    total_usd NUMERIC DEFAULT 0,
-    snipe_count INT DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS blacklist (
-    id SERIAL PRIMARY KEY,
-    entry_type TEXT NOT NULL,
-    value TEXT NOT NULL UNIQUE,
-    reason TEXT,
-    added_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS purchased_assets (
-    id SERIAL PRIMARY KEY,
-    asset_id TEXT NOT NULL UNIQUE,
-    marketplace TEXT NOT NULL,
-    chain TEXT NOT NULL,
-    purchased_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_opps_ts ON opportunities(ts);
-CREATE INDEX IF NOT EXISTS idx_opps_action ON opportunities(action);
-CREATE INDEX IF NOT EXISTS idx_purchased ON purchased_assets(asset_id);
-CREATE INDEX IF NOT EXISTS idx_blacklist ON blacklist(entry_type, value);
-"""
+# asyncpg's Connection.execute runs a single statement reliably; splitting
+# the schema into individual statements avoids silent partial execution.
+SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS opportunities (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ DEFAULT NOW(),
+        marketplace TEXT NOT NULL,
+        chain TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        asset_name TEXT,
+        listing_price NUMERIC NOT NULL,
+        fair_value NUMERIC NOT NULL,
+        discount_pct NUMERIC NOT NULL,
+        confidence TEXT NOT NULL,
+        action TEXT DEFAULT 'pending',
+        tx_hash TEXT,
+        cost_usd NUMERIC,
+        paper_mode BOOLEAN DEFAULT TRUE,
+        alert_sent BOOLEAN DEFAULT FALSE,
+        cancelled BOOLEAN DEFAULT FALSE,
+        executed BOOLEAN DEFAULT FALSE,
+        metadata JSONB DEFAULT '{}'
+    )""",
+    """CREATE TABLE IF NOT EXISTS daily_spend (
+        date DATE PRIMARY KEY,
+        total_usd NUMERIC DEFAULT 0,
+        snipe_count INT DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS blacklist (
+        id SERIAL PRIMARY KEY,
+        entry_type TEXT NOT NULL,
+        value TEXT NOT NULL UNIQUE,
+        reason TEXT,
+        added_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE TABLE IF NOT EXISTS purchased_assets (
+        id SERIAL PRIMARY KEY,
+        asset_id TEXT NOT NULL UNIQUE,
+        marketplace TEXT NOT NULL,
+        chain TEXT NOT NULL,
+        purchased_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_opps_ts ON opportunities(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_opps_action ON opportunities(action)",
+    "CREATE INDEX IF NOT EXISTS idx_purchased ON purchased_assets(asset_id)",
+    "CREATE INDEX IF NOT EXISTS idx_blacklist ON blacklist(entry_type, value)",
+]
 
 
 async def init_db():
@@ -68,7 +66,8 @@ async def init_db():
         return
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with _pool.acquire() as conn:
-        await conn.execute(SCHEMA)
+        for stmt in SCHEMA_STATEMENTS:
+            await conn.execute(stmt)
     logger.info("Database initialized")
 
 

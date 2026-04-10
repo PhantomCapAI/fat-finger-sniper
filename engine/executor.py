@@ -24,7 +24,7 @@ from db import (
     is_duplicate, record_purchase, get_daily_spend, add_daily_spend,
     log_opportunity, mark_executed, mark_cancelled,
 )
-from engine.killswitch import send_killswitch_alert, wait_for_decision, update_message
+from engine.killswitch import send_killswitch_alert, wait_for_decision, update_message, is_scanner_paused
 from engine.honeypot import is_safe_opportunity
 from engine.autosell import schedule_autosell
 
@@ -41,6 +41,11 @@ async def process_opportunity(opp: dict) -> dict:
     asset_id = opp["asset_id"]
     listing_price = opp["listing_price"]
     result = {"asset_id": asset_id, "action": "skipped", "reason": ""}
+
+    # --- Global pause check (set by Telegram /stop) ---
+    if is_scanner_paused():
+        result["reason"] = "scanner_paused"
+        return result
 
     # --- Duplicate check ---
     if await is_duplicate(asset_id):
