@@ -1,175 +1,350 @@
-"""fat-finger-sniper — On-chain monitor for mispriced NFT listings."""
+"""fat-finger-sniper — Multi-marketplace misprice detection and execution engine."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from config import POLL_INTERVAL_ETH, POLL_INTERVAL_SOL, MAX_WATCHLIST
-from monitors import opensea, magiceden
-from alerts import send_alert
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+from config import (
+    PAPER_MODE, POLL_INTERVAL_NFT, POLL_INTERVAL_DEX,
+    POLL_INTERVAL_POLY, POLL_INTERVAL_TRAD,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MAX_DAILY_USD,
 )
+from db import init_db, close_db, get_stats, get_recent_opportunities, add_blacklist
+from engine.executor import process_opportunity
+from engine.killswitch import handle_callback
+from engine.pipeline import send_to_pipeline, send_fun_telegram
+from monitors import opensea, magiceden, tensor, jupiter, polymarket
+from monitors import stockx, tcgplayer, godaddy, ebay
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- State ---
+# --- Watchlists (in-memory, managed via API) ---
+watchlist_nft_eth: list[str] = []   # OpenSea slugs
+watchlist_nft_sol: list[str] = []   # Magic Eden symbols / Tensor slugs
+watchlist_stockx: list[str] = []    # StockX search queries
+watchlist_tcg: list[tuple[str, str]] = []  # (game, query) pairs
+watchlist_godaddy: list[str] = []   # Domain search queries
+watchlist_ebay: dict[str, float] = {}  # query -> fair_value_usd
 
-watchlist_eth: dict[str, dict] = {}  # slug -> {added_at, last_scan, hits}
-watchlist_sol: dict[str, dict] = {}  # symbol -> {added_at, last_scan, hits}
-recent_alerts: list[dict] = []       # last N alerts
-_scan_tasks: list[asyncio.Task] = []
-MAX_RECENT = 200
+_tasks: list[asyncio.Task] = []
 
 
-# --- Background scanners ---
+# --- Background Scanners ---
 
-async def eth_scanner():
-    """Poll OpenSea collections for fat-finger listings."""
+async def _process_all(opps: list[dict]):
+    """Process a batch of opportunities through the execution pipeline."""
+    for opp in opps:
+        try:
+            result = await process_opportunity(opp)
+            action = result.get("action", "skipped")
+            if action in ("executed", "paper_logged"):
+                await send_fun_telegram(opp, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+                await send_to_pipeline(opp, action)
+            logger.info(f"{opp['marketplace']}/{opp['asset_id']}: {action} ({result.get('reason', '')})")
+        except Exception as e:
+            logger.error(f"Process error: {e}")
+
+
+async def nft_eth_scanner():
+    """Poll OpenSea for ETH NFT fat fingers."""
     while True:
-        for slug in list(watchlist_eth.keys()):
+        for slug in list(watchlist_nft_eth):
             try:
-                flagged = await opensea.scan_collection(slug)
-                watchlist_eth[slug]["last_scan"] = datetime.now(timezone.utc).isoformat()
-                for f in flagged:
-                    watchlist_eth[slug]["hits"] = watchlist_eth[slug].get("hits", 0) + 1
-                    recent_alerts.append(f)
-                    if len(recent_alerts) > MAX_RECENT:
-                        recent_alerts.pop(0)
-                    await send_alert(f)
-                    logger.info(f"ETH fat finger: {slug} {f.get('token_id')} @ {f.get('listing_price')} (floor {f.get('floor_price')})")
+                opps = await opensea.scan(slug)
+                await _process_all(opps)
             except Exception as e:
-                logger.error(f"ETH scan error {slug}: {e}")
-            await asyncio.sleep(1)  # rate limit between collections
-        await asyncio.sleep(POLL_INTERVAL_ETH)
-
-
-async def sol_scanner():
-    """Poll Magic Eden collections for fat-finger listings."""
-    while True:
-        for symbol in list(watchlist_sol.keys()):
-            try:
-                flagged = await magiceden.scan_collection(symbol)
-                watchlist_sol[symbol]["last_scan"] = datetime.now(timezone.utc).isoformat()
-                for f in flagged:
-                    watchlist_sol[symbol]["hits"] = watchlist_sol[symbol].get("hits", 0) + 1
-                    recent_alerts.append(f)
-                    if len(recent_alerts) > MAX_RECENT:
-                        recent_alerts.pop(0)
-                    await send_alert(f)
-                    logger.info(f"SOL fat finger: {symbol} {f.get('token_mint', '')[:8]}... @ {f.get('listing_price_sol')} (floor {f.get('floor_price_sol')})")
-            except Exception as e:
-                logger.error(f"SOL scan error {symbol}: {e}")
+                logger.error(f"OpenSea scan {slug}: {e}")
             await asyncio.sleep(1)
-        await asyncio.sleep(POLL_INTERVAL_SOL)
+        await asyncio.sleep(POLL_INTERVAL_NFT)
 
+
+async def nft_sol_scanner():
+    """Poll Magic Eden + Tensor for Solana NFT fat fingers."""
+    while True:
+        for symbol in list(watchlist_nft_sol):
+            try:
+                me_opps = await magiceden.scan(symbol)
+                t_opps = await tensor.scan(symbol)
+                await _process_all(me_opps + t_opps)
+            except Exception as e:
+                logger.error(f"SOL NFT scan {symbol}: {e}")
+            await asyncio.sleep(1)
+        await asyncio.sleep(POLL_INTERVAL_NFT)
+
+
+async def dex_scanner():
+    """Poll Jupiter for DEX misprices."""
+    while True:
+        try:
+            opps = await jupiter.scan()
+            await _process_all(opps)
+        except Exception as e:
+            logger.error(f"DEX scan: {e}")
+        await asyncio.sleep(POLL_INTERVAL_DEX)
+
+
+async def polymarket_scanner():
+    """Poll Polymarket for mispriced shares."""
+    while True:
+        try:
+            opps = await polymarket.scan()
+            await _process_all(opps)
+        except Exception as e:
+            logger.error(f"Polymarket scan: {e}")
+        await asyncio.sleep(POLL_INTERVAL_POLY)
+
+
+async def traditional_scanner():
+    """Poll StockX, TCGPlayer, GoDaddy, eBay."""
+    while True:
+        try:
+            if watchlist_stockx:
+                opps = await stockx.scan(watchlist_stockx)
+                await _process_all(opps)
+        except Exception as e:
+            logger.error(f"StockX scan: {e}")
+
+        try:
+            if watchlist_tcg:
+                games = [g for g, q in watchlist_tcg]
+                queries = [q for g, q in watchlist_tcg]
+                opps = await tcgplayer.scan(games, queries)
+                await _process_all(opps)
+        except Exception as e:
+            logger.error(f"TCGPlayer scan: {e}")
+
+        try:
+            if watchlist_godaddy:
+                opps = await godaddy.scan(watchlist_godaddy)
+                await _process_all(opps)
+        except Exception as e:
+            logger.error(f"GoDaddy scan: {e}")
+
+        try:
+            if watchlist_ebay:
+                opps = await ebay.scan(watchlist_ebay)
+                await _process_all(opps)
+        except Exception as e:
+            logger.error(f"eBay scan: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL_TRAD)
+
+
+# --- App Lifecycle ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Fat Finger Sniper starting...")
-    t1 = asyncio.create_task(eth_scanner())
-    t2 = asyncio.create_task(sol_scanner())
-    _scan_tasks.extend([t1, t2])
+    await init_db()
+    logger.info(f"Fat Finger Sniper starting (paper_mode={PAPER_MODE})")
+    _tasks.extend([
+        asyncio.create_task(nft_eth_scanner()),
+        asyncio.create_task(nft_sol_scanner()),
+        asyncio.create_task(dex_scanner()),
+        asyncio.create_task(polymarket_scanner()),
+        asyncio.create_task(traditional_scanner()),
+    ])
     yield
-    for t in _scan_tasks:
+    for t in _tasks:
         t.cancel()
+    await close_db()
 
-
-# --- App ---
 
 app = FastAPI(title="fat-finger-sniper", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+# --- Health & Dashboard ---
+
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "service": "fat-finger-sniper",
-        "watchlist_eth": len(watchlist_eth),
-        "watchlist_sol": len(watchlist_sol),
-        "total_alerts": len(recent_alerts),
+        "paper_mode": PAPER_MODE,
+        "watchlists": {
+            "nft_eth": len(watchlist_nft_eth),
+            "nft_sol": len(watchlist_nft_sol),
+            "stockx": len(watchlist_stockx),
+            "tcg": len(watchlist_tcg),
+            "godaddy": len(watchlist_godaddy),
+            "ebay": len(watchlist_ebay),
+        },
     }
 
-
-# --- Watchlist management ---
-
-@app.post("/watch/eth/{slug}")
-async def watch_eth(slug: str):
-    """Add an OpenSea collection to the ETH watchlist."""
-    if len(watchlist_eth) >= MAX_WATCHLIST:
-        return {"error": f"max {MAX_WATCHLIST} collections"}, 400
-    if slug in watchlist_eth:
-        return {"status": "already_watching", "slug": slug}
-    watchlist_eth[slug] = {"added_at": datetime.now(timezone.utc).isoformat(), "last_scan": None, "hits": 0}
-    return {"status": "watching", "slug": slug, "chain": "ethereum"}
-
-
-@app.post("/watch/sol/{symbol}")
-async def watch_sol(symbol: str):
-    """Add a Magic Eden collection to the SOL watchlist."""
-    if len(watchlist_sol) >= MAX_WATCHLIST:
-        return {"error": f"max {MAX_WATCHLIST} collections"}, 400
-    if symbol in watchlist_sol:
-        return {"status": "already_watching", "symbol": symbol}
-    watchlist_sol[symbol] = {"added_at": datetime.now(timezone.utc).isoformat(), "last_scan": None, "hits": 0}
-    return {"status": "watching", "symbol": symbol, "chain": "solana"}
-
-
-@app.delete("/watch/eth/{slug}")
-async def unwatch_eth(slug: str):
-    """Remove an OpenSea collection from the ETH watchlist."""
-    if slug in watchlist_eth:
-        del watchlist_eth[slug]
-        return {"status": "removed", "slug": slug}
-    return {"status": "not_found", "slug": slug}
-
-
-@app.delete("/watch/sol/{symbol}")
-async def unwatch_sol(symbol: str):
-    """Remove a Magic Eden collection from the SOL watchlist."""
-    if symbol in watchlist_sol:
-        del watchlist_sol[symbol]
-        return {"status": "removed", "symbol": symbol}
-    return {"status": "not_found", "symbol": symbol}
-
-
-# --- Scanning ---
-
-@app.get("/scan/eth/{slug}")
-async def scan_eth(slug: str):
-    """One-shot scan of an OpenSea collection for fat-finger listings."""
-    floor = await opensea.get_collection_floor(slug)
-    flagged = await opensea.scan_collection(slug)
-    return {"collection": slug, "chain": "ethereum", "floor": floor, "flagged": flagged, "count": len(flagged)}
-
-
-@app.get("/scan/sol/{symbol}")
-async def scan_sol(symbol: str):
-    """One-shot scan of a Magic Eden collection for fat-finger listings."""
-    stats = await magiceden.get_collection_stats(symbol)
-    flagged = await magiceden.scan_collection(symbol)
-    return {"collection": symbol, "chain": "solana", "stats": stats, "flagged": flagged, "count": len(flagged)}
-
-
-# --- Dashboard ---
 
 @app.get("/dashboard")
 async def dashboard():
-    """Full dashboard: watchlists, recent alerts, stats."""
+    stats = await get_stats()
+    recent = await get_recent_opportunities(50)
+    # Serialize datetime objects
+    for r in recent:
+        for k, v in r.items():
+            if isinstance(v, datetime):
+                r[k] = v.isoformat()
     return {
-        "watchlist_eth": {slug: info for slug, info in watchlist_eth.items()},
-        "watchlist_sol": {sym: info for sym, info in watchlist_sol.items()},
-        "recent_alerts": recent_alerts[-50:],
-        "total_alerts": len(recent_alerts),
+        "paper_mode": PAPER_MODE,
+        "max_daily_usd": MAX_DAILY_USD,
+        "stats": stats,
+        "recent_opportunities": recent,
+        "watchlists": {
+            "nft_eth": watchlist_nft_eth,
+            "nft_sol": watchlist_nft_sol,
+            "stockx": watchlist_stockx,
+            "tcg": watchlist_tcg,
+            "godaddy": watchlist_godaddy,
+            "ebay": {k: v for k, v in watchlist_ebay.items()},
+        },
     }
 
 
-@app.get("/alerts")
-async def get_alerts(limit: int = 50):
-    """Get recent fat-finger alerts."""
-    return {"alerts": recent_alerts[-limit:], "total": len(recent_alerts)}
+@app.get("/stats")
+async def stats():
+    return await get_stats()
+
+
+# --- Watchlist Management ---
+
+@app.post("/watch/nft/eth/{slug}")
+async def watch_nft_eth(slug: str):
+    if slug not in watchlist_nft_eth:
+        watchlist_nft_eth.append(slug)
+    return {"status": "watching", "slug": slug, "chain": "ethereum"}
+
+
+@app.post("/watch/nft/sol/{symbol}")
+async def watch_nft_sol(symbol: str):
+    if symbol not in watchlist_nft_sol:
+        watchlist_nft_sol.append(symbol)
+    return {"status": "watching", "symbol": symbol, "chain": "solana"}
+
+
+@app.post("/watch/stockx")
+async def watch_stockx(request: Request):
+    body = await request.json()
+    query = body.get("query", "")
+    if query and query not in watchlist_stockx:
+        watchlist_stockx.append(query)
+    return {"status": "watching", "query": query}
+
+
+@app.post("/watch/tcg")
+async def watch_tcg(request: Request):
+    body = await request.json()
+    game = body.get("game", "pokemon")
+    query = body.get("query", "")
+    if query:
+        watchlist_tcg.append((game, query))
+    return {"status": "watching", "game": game, "query": query}
+
+
+@app.post("/watch/godaddy")
+async def watch_godaddy(request: Request):
+    body = await request.json()
+    query = body.get("query", "")
+    if query and query not in watchlist_godaddy:
+        watchlist_godaddy.append(query)
+    return {"status": "watching", "query": query}
+
+
+@app.post("/watch/ebay")
+async def watch_ebay(request: Request):
+    body = await request.json()
+    query = body.get("query", "")
+    fair_value = body.get("fair_value", 0)
+    if query and fair_value > 0:
+        watchlist_ebay[query] = fair_value
+    return {"status": "watching", "query": query, "fair_value": fair_value}
+
+
+@app.delete("/watch/nft/eth/{slug}")
+async def unwatch_nft_eth(slug: str):
+    if slug in watchlist_nft_eth:
+        watchlist_nft_eth.remove(slug)
+    return {"status": "removed", "slug": slug}
+
+
+@app.delete("/watch/nft/sol/{symbol}")
+async def unwatch_nft_sol(symbol: str):
+    if symbol in watchlist_nft_sol:
+        watchlist_nft_sol.remove(symbol)
+    return {"status": "removed", "symbol": symbol}
+
+
+# --- One-shot Scans ---
+
+@app.get("/scan/opensea/{slug}")
+async def scan_opensea(slug: str):
+    opps = await opensea.scan(slug)
+    return {"marketplace": "opensea", "collection": slug, "opportunities": opps, "count": len(opps)}
+
+
+@app.get("/scan/magiceden/{symbol}")
+async def scan_magiceden(symbol: str):
+    opps = await magiceden.scan(symbol)
+    return {"marketplace": "magiceden", "collection": symbol, "opportunities": opps, "count": len(opps)}
+
+
+@app.get("/scan/tensor/{slug}")
+async def scan_tensor(slug: str):
+    opps = await tensor.scan(slug)
+    return {"marketplace": "tensor", "collection": slug, "opportunities": opps, "count": len(opps)}
+
+
+@app.get("/scan/polymarket")
+async def scan_polymarket():
+    opps = await polymarket.scan()
+    return {"marketplace": "polymarket", "opportunities": opps, "count": len(opps)}
+
+
+# --- Blacklist ---
+
+@app.post("/blacklist")
+async def add_to_blacklist(request: Request):
+    body = await request.json()
+    entry_type = body.get("type", "collection")  # collection, seller, contract
+    value = body.get("value", "")
+    reason = body.get("reason", "")
+    await add_blacklist(entry_type, value, reason)
+    return {"status": "blacklisted", "type": entry_type, "value": value}
+
+
+# --- Telegram Callback Handler ---
+
+@app.post("/webhook/telegram")
+async def telegram_webhook(request: Request):
+    """Handle Telegram inline keyboard callbacks (CANCEL / BUY NOW)."""
+    body = await request.json()
+    callback = body.get("callback_query")
+    if not callback:
+        return {"ok": True}
+
+    data = callback.get("data", "")
+    if ":" not in data:
+        return {"ok": True}
+
+    action, opp_id_str = data.split(":", 1)
+    try:
+        opp_id = int(opp_id_str)
+    except ValueError:
+        return {"ok": True}
+
+    handle_callback(opp_id, action)
+
+    # Answer the callback to remove loading spinner
+    callback_id = callback.get("id")
+    if callback_id and TELEGRAM_BOT_TOKEN:
+        import httpx
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(url, json={
+                "callback_query_id": callback_id,
+                "text": f"{'Cancelled' if action == 'cancel' else 'Executing...'}"
+            })
+
+    return {"ok": True}
