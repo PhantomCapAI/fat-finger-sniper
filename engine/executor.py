@@ -7,19 +7,6 @@ from config import (
     PAPER_MODE, MAX_PER_SNIPE_USD, MAX_DAILY_USD, MAX_BANKROLL_USD,
     COOLDOWN_SECONDS,
 )
-
-# BTC/ETH/SOL at CRITICAL (>95% discount): no per-snipe cap, use full wallet
-YOLO_ASSETS = {
-    # Solana
-    "So11111111111111111111111111111111111111112",   # SOL
-    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", # WBTC (Solana)
-    # Ethereum
-    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # WETH
-    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",  # WBTC
-    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",  # cbBTC
-    "0x18084fbA666a33d37592fA2633fD49a74DD93a88",  # tBTC
-}
-YOLO_SYMBOLS = {"BTC", "WBTC", "CBBTC", "TBTC", "ETH", "WETH", "SOL"}
 from db import (
     is_duplicate, record_purchase, get_daily_spend, add_daily_spend,
     log_opportunity, mark_executed, mark_cancelled,
@@ -61,26 +48,17 @@ async def process_opportunity(opp: dict) -> dict:
     # --- Estimate USD cost ---
     cost_usd = _estimate_usd(opp)
 
-    # --- YOLO override: BTC/ETH/SOL at CRITICAL = no cap ---
-    is_yolo = _is_yolo_opportunity(opp)
-
-    # --- Risk controls ---
-    if not is_yolo and cost_usd > MAX_PER_SNIPE_USD:
+    # --- Risk controls (unconditional — no override tiers) ---
+    if cost_usd > MAX_PER_SNIPE_USD:
         result["reason"] = f"exceeds_max_per_snipe (${cost_usd:.2f} > ${MAX_PER_SNIPE_USD})"
         return result
 
-    if is_yolo:
-        logger.warning(
-            f"YOLO MODE: {opp.get('asset_name')} at {opp.get('discount_pct')}% discount — "
-            f"no per-snipe cap, using full wallet balance"
-        )
-
     daily = await get_daily_spend()
-    if not is_yolo and daily + cost_usd > MAX_DAILY_USD:
+    if daily + cost_usd > MAX_DAILY_USD:
         result["reason"] = f"exceeds_daily_limit (${daily:.2f} + ${cost_usd:.2f} > ${MAX_DAILY_USD})"
         return result
 
-    if not is_yolo and _total_spent + cost_usd > MAX_BANKROLL_USD:
+    if _total_spent + cost_usd > MAX_BANKROLL_USD:
         result["reason"] = f"exceeds_bankroll (${_total_spent:.2f} + ${cost_usd:.2f} > ${MAX_BANKROLL_USD})"
         return result
 
@@ -148,32 +126,6 @@ async def process_opportunity(opp: dict) -> dict:
         result["reason"] = str(e)
 
     return result
-
-
-def _is_yolo_opportunity(opp: dict) -> bool:
-    """Check if this is a BTC/ETH/SOL CRITICAL opportunity.
-
-    These three assets at >95% discount bypass all per-snipe caps.
-    Full wallet balance goes in. Once-in-a-lifetime.
-    """
-    confidence = opp.get("confidence", "")
-    if confidence != "CRITICAL":
-        return False
-
-    asset_id = opp.get("asset_id", "")
-    asset_name = (opp.get("asset_name", "") or "").upper()
-    currency = (opp.get("currency", "") or "").upper()
-
-    # Check by contract address
-    if asset_id in YOLO_ASSETS:
-        return True
-
-    # Check by symbol in name or currency
-    for sym in YOLO_SYMBOLS:
-        if sym in asset_name or sym in currency:
-            return True
-
-    return False
 
 
 def _estimate_usd(opp: dict) -> float:

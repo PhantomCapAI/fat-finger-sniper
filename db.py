@@ -137,7 +137,7 @@ async def record_purchase(asset_id: str, marketplace: str, chain: str):
 async def get_daily_spend() -> float:
     if not _pool:
         return 0.0
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).date()
     async with _pool.acquire() as conn:
         row = await conn.fetchrow("SELECT total_usd FROM daily_spend WHERE date=$1", today)
         return float(row["total_usd"]) if row else 0.0
@@ -146,7 +146,7 @@ async def get_daily_spend() -> float:
 async def add_daily_spend(amount: float):
     if not _pool:
         return
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).date()
     async with _pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO daily_spend (date, total_usd, snipe_count) VALUES ($1, $2, 1)
