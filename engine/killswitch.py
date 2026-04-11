@@ -188,21 +188,48 @@ async def _send_message(chat_id: str, text: str) -> None:
         logger.error(f"send_message failed: {e}")
 
 
-async def _get_sol_balance(pubkey: str) -> float | None:
-    if not pubkey or not SOLANA_RPC_URL:
-        return None
+PUBLIC_SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+
+
+async def _rpc_get_balance(rpc_url: str, pubkey: str) -> tuple[int | None, str | None]:
+    """Hit a single Solana RPC for getBalance. Returns (lamports, error_message)."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                SOLANA_RPC_URL,
+                rpc_url,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]},
             )
             data = resp.json()
-            lamports = data.get("result", {}).get("value", 0)
-            return lamports / 1_000_000_000
+            if "error" in data and data["error"] is not None:
+                err = data["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                return None, f"rpc_error: {msg}"
+            result = data.get("result")
+            if not isinstance(result, dict) or "value" not in result:
+                return None, f"unexpected_shape: {str(data)[:160]}"
+            return int(result["value"]), None
     except Exception as e:
-        logger.error(f"getBalance failed: {e}")
+        return None, f"exception: {e}"
+
+
+async def _get_sol_balance(pubkey: str) -> float | None:
+    if not pubkey:
         return None
+
+    # Try the configured RPC first (usually Helius with embedded key).
+    if SOLANA_RPC_URL:
+        lamports, err = await _rpc_get_balance(SOLANA_RPC_URL, pubkey)
+        if lamports is not None:
+            return lamports / 1_000_000_000
+        logger.warning(f"primary RPC getBalance failed ({err}); trying public fallback")
+
+    # Fallback to public mainnet-beta so /balance is still informative
+    # when the primary RPC key is dead.
+    lamports, err = await _rpc_get_balance(PUBLIC_SOLANA_RPC, pubkey)
+    if lamports is None:
+        logger.error(f"public RPC fallback also failed: {err}")
+        return None
+    return lamports / 1_000_000_000
 
 
 async def _format_status() -> str:
